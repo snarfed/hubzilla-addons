@@ -486,6 +486,8 @@ function diaspora_discover(&$b) {
 	$diaspora_base = '';
 	$diaspora_guid = '';
 	$diaspora_key = '';
+	$guid = '';
+
 	$dfrn = false;
 
 	$x = $b['webfinger'];
@@ -521,7 +523,7 @@ function diaspora_discover(&$b) {
 		}
 	}
 
-	if($diaspora && $diaspora_base && $diaspora_guid) {
+	if($diaspora && $diaspora_base) {
 		$x = false;
 	}
 
@@ -557,8 +559,11 @@ function diaspora_discover(&$b) {
 		}
 	}
 
-	if($diaspora && $diaspora_base && $diaspora_guid) {
-		$guid = $diaspora_guid;
+	if($diaspora && $diaspora_base) {
+
+		if($diaspora_guid)
+			$guid = $diaspora_guid;
+
 		$diaspora_base = trim($diaspora_base,'/');
 
 		$notify = $diaspora_base . '/receive';
@@ -580,6 +585,8 @@ function diaspora_discover(&$b) {
 			$vcard['nick'] = substr($webbie,0,strpos($webbie,'@'));
 			if(! $vcard['fn'])
 				$vcard['fn'] = $webbie;
+			if(($vcard['uid']) && (! $diaspora_guid))
+				$diaspora_guid = $guid = $vcard['uid'];
 		} 
 
 		$r = q("select * from xchan where xchan_hash = '%s' limit 1",
