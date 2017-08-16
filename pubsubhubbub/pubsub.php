@@ -42,16 +42,6 @@ function pubsub_init(&$a) {
 			}
 		} 
 
-		$feed_url  = z_root() . '/feed/'  . $channel['channel_address'];
-		$ofeed_url = z_root() . '/ofeed/' . $channel['channel_address'];
-
-		if($hub_topic) {
-			if((! link_compare($hub_topic,$feed_url)) && (! link_compare($hub_topic,$ofeed_url))) {
-				logger('hub topic ' . $hub_topic . ' != ' . $feed_url);
-				// should abort but let's humour them.
-			}
-		}
-
 		$contact = $r[0];
 
 		// We must initiate an unsubscribe request with a verify_token. 
@@ -108,7 +98,6 @@ function pubsub_post(&$a) {
 		$importer_arr[] = $sys;
 
 
-
 	foreach($importer_arr as $channel) {
 		if(! $channel['system']) {
 			$connections = abook_connections($channel['channel_id'], ' and abook_id = ' . $contact_id);
@@ -128,6 +117,13 @@ function pubsub_post(&$a) {
 		if((! perm_is_allowed($channel['channel_id'],$xchan['xchan_hash'],'send_stream')) && (! $channel['system'])) {
 			logger('permission denied.');
 			continue;
+		}
+
+		if(! $channel['system']) {
+			q("update abook set abook_connected = '%s' where abook_id = %d",
+				dbesc(datetime_convert()),
+				intval($xchan['abook_id'])
+			);
 		}
 
 		consume_feed($xml,$channel,$xchan,1);

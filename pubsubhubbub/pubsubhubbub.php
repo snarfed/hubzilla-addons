@@ -2,9 +2,10 @@
 
 /**
  * Name: PubSubHubBub
- * Description: Add PuSH capability to channel feeds - based loosely on Friendica PuSH module by Mats Sjöberg
+ * Description: Required for GNU-Social protocol. Add PuSH capability to channel feeds
  * Version: 1.0
  * Author: Mike Macgirvin
+ * Author: Mats Sjöberg
  * Maintainer: none
  * MinVersion: 1.2.2
  */
@@ -13,12 +14,12 @@
 function pubsubhubbub_install() {
 	$r = q("CREATE TABLE IF NOT EXISTS `push_subscriber` (
 	  `id` int(11) NOT NULL AUTO_INCREMENT,
-	  `callback_url` varchar(255) NOT NULL DEFAULT '',
-	  `topic` varchar(255) NOT NULL DEFAULT '',
+	  `callback_url` varchar(191) NOT NULL DEFAULT '',
+	  `topic` varchar(191) NOT NULL DEFAULT '',
 	  `last_update` datetime NOT NULL DEFAULT '0001-01-01 00:00:00',
-	  `secret` varchar(255) NOT NULL DEFAULT '',
+	  `secret` varchar(191) NOT NULL DEFAULT '',
 	  PRIMARY KEY (`id`)
-		) ENGINE=MyISAM DEFAULT CHARSET=utf8");
+		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 	if($r) {
 		q("alter table push_subscriber add index ( callback_url ) ");
 		q("alter table push_subscriber add index ( topic ) ");
@@ -38,6 +39,7 @@ function pubsubhubbub_load() {
 	register_hook('queue_deliver','addon/pubsubhubbub/pubsubhubbub.php','push_queue_deliver');
 	register_hook('atom_feed','addon/pubsubhubbub/pubsubhubbub.php','push_atom_feed');
 	register_hook('module_loaded', 'addon/pubsubhubbub/pubsubhubbub.php','push_module_loaded');
+	register_hook('channel_mod_content', 'addon/pubsubhubbub/pubsubhubbub.php','push_channel_mod_content');
 
 }
 
@@ -46,6 +48,7 @@ function pubsubhubbub_unload() {
 	unregister_hook('queue_deliver','addon/pubsubhubbub/pubsubhubbub.php','push_queue_deliver');
 	unregister_hook('atom_feed','addon/pubsubhubbub/pubsubhubbub.php','push_atom_feed');
 	unregister_hook('module_loaded', 'addon/pubsubhubbub/pubsubhubbub.php','push_module_loaded');
+	unregister_hook('channel_mod_content', 'addon/pubsubhubbub/pubsubhubbub.php','push_channel_mod_content');
 }
 
 
@@ -58,6 +61,29 @@ function push_module_loaded(&$a,&$b) {
 	if($b['module'] === 'pubsub') {
 		require_once('addon/pubsubhubbub/pubsub.php');
 		$b['installed'] = true;
+	}
+}
+
+function push_channel_mod_content($a,&$b) {
+
+	if(! App::$profile)
+		return;
+
+	$channel = App::$profile['channel_address'];
+
+	if($channel) {
+		head_add_link([
+			'rel'  => 'hub',
+			'href' => z_root() . '/pubsubhubbub'
+		]);
+
+		// This is technically correct, but at this time is not recognised as a feed topic and
+		// will only be recognised as such with particular/select content-types. 
+
+		head_add_link([
+			'rel'  => 'self',
+			'href' => z_root() . '/channel/' . $channel
+		]);
 	}
 }
 
@@ -76,15 +102,21 @@ function push_notifier_process(&$a,&$b) {
 		return;
 	}
 
-	if($b['upstream'])  {
-		logger('Not a downstream post. Not suitable for PuSH forwarding.');
-		return;
-	}
-
-
 	// find push_subscribers following this $owner
 
 	$channel = $b['channel'];
+
+	// We will send a copy to all our ostatus/websub followers going both upstream and downstream.
+	// This could result in duplicated deliveries if the top-level post is our own.
+	// Check for that condition and only send downstream in that case.
+ 
+	if(array_key_exists('parent_item',$b) && $b['parent_item']) {
+
+		if($b['upstream'] && $channel['channel_hash'] === $b['parent_item']['owner_xchan']) {
+			return;
+		}
+	}
+
 
 	// allow subscriptions either by http or https, as gnu-social has been known to subscribe
 	// to the wrong one.
@@ -101,9 +133,11 @@ function push_notifier_process(&$a,&$b) {
 
 	foreach($r as $rr) {
 
-		$compat = ((strpos('/ofeed/',$rr['topic'])) ? 1 : 0);
+		$compat = ((strpos($rr['topic'],'/ofeed/')) ? 1 : 0);
 
-		$feed = get_feed_for($channel,'',array('begin' => $rr['last_update'], 'compat' => $compat));
+		$feed = get_feed_for($channel,'',array('begin' => $rr['last_update'], 'compat' => $compat, 'start' => 0, 'records' => 255 ));
+
+		logger('feed: ' . $feed,LOGGER_DATA);
 
 		$hmac_sig = hash_hmac("sha1", $feed, $rr['secret']);
 
@@ -140,8 +174,8 @@ function push_notifier_process(&$a,&$b) {
 		$b['queued'][] = $hash;
 	}
 
-
 }
+
 
 function push_queue_deliver(&$a,&$b) {
 
@@ -258,7 +292,7 @@ function pubsubhubbub_init(&$a) {
 		}
 
 		// sanity check that topic URLs are the same
-		if(! link_compare($hub_topic, z_root() . '/feed/' . $nick)) {
+		if((! link_compare($hub_topic, z_root() . '/feed/' . $nick)) && (! link_compare($hub_topic, z_root() . '/ofeed/' . $nick))) {
 			logger('pubsubhubbub: not a valid hub topic ' . $hub_topic );
 			http_status_exit(404);
 		}

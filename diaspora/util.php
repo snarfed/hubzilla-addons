@@ -183,6 +183,31 @@ function diaspora_magic_env($channel,$msg) {
 	);
 }
 
+function diaspora_share_unsigned(&$item,$author) {
+
+	if(! $author) {
+		$r = q("select * from xchan where xchan_hash = '%s' limit 1",
+			dbesc($item['author_xchan'])
+		);
+		if($r) {
+			$author = $r[0];
+		}
+		else {
+			return;
+		}
+	}
+
+	// post will come across with the owner's identity. Throw a preamble onto the post to indicate the true author.
+	$item['body'] = "\n\n"
+		. '[quote]'
+		. '[img]' . $author['xchan_photo_s'] . '[/img]'
+		. ' '
+		. '[url=' . $author['xchan_url'] . '][b]' . $author['xchan_name'] . '[/b][/url]' . "\n\n"
+		. $item['body']
+		. '[/quote]';
+
+}
+
 
 function diaspora_build_status($item,$owner) {
 
@@ -193,10 +218,15 @@ function diaspora_build_status($item,$owner) {
 		return;
 	}
 
+	if(($item['item_wall']) && ($item['owner_xchan'] != $item['author_xchan']) &&
+		get_pconfig($owner['channel_id'],'diaspora','sign_unsigned')) {
+		diaspora_share_unsigned($item,(($item['author']) ? $item['author'] : null));
+	}
+
 	$images = array();
 
 	$title = $item['title'];
-	$body = bb2diaspora_itembody($item,true);
+	$body = bb_to_markdown($item['body'], [ 'diaspora' ]);
 
 	$poll = '';
 
@@ -204,34 +234,200 @@ function diaspora_build_status($item,$owner) {
 
 	$created = datetime_convert('UTC','UTC',$item['created'],'Y-m-d H:i:s \U\T\C');
 
-	// Detect a share element and do a reshare
+	$created_at = datetime_convert('UTC','UTC',$item['created'],ATOM_TIME);
 
-	if((! $item['item_private']) && ($ret = diaspora_is_reshare($item['body']))) {
-		$msg = replace_macros(get_markup_template('diaspora_reshare.tpl','addon/diaspora'),
-			[
-				'$root_handle' => xmlify($ret['root_handle']),
-				'$root_guid' => $ret['root_guid'],
-				'$guid' => $item['mid'],
-				'$handle' => xmlify($myaddr),
-				'$public' => $public,
-				'$created' => $created,
-				'$provider' => (($item['app']) ? $item['app'] : t('$projectname'))
-			]
-		);
-	} 
+	if(defined('DIASPORA_V2')) {
+
+		// common attributes
+
+		$arr = [
+			'author'     => $myaddr,
+			'guid'       => $item['mid'],
+			'created_at' => $created_at,
+		];
+
+		// context specific attributes
+
+		if((! $item['item_private']) && ($ret = diaspora_is_reshare($item['body']))) {
+			$arr['root_author'] = $ret['root_handle'];
+			$arr['root_guid']   = $ret['root_guid'];
+			$msg = arrtoxml('reshare', $arr);
+		} 
+		else {
+			$arr['public'] = $public;
+			$arr['text']   = $body;
+
+			if($item['app'])
+				$arr['provider_display_name'] = $item['app'];
+
+			if($item['location'] || $item['coord']) {
+				//@TODO once we figure out if they will accept location and coordinates separately,
+				// at present it seems you need both and fictitious locations aren't acceptable
+			}
+			$msg = arrtoxml('status_message', $arr);
+		}
+	}
 	else {
-		$msg = replace_macros(get_markup_template('diaspora_post.tpl','addon/diaspora'),
-			[
-				'$body' => xmlify($body),
-				'$guid' => $item['mid'],
-				'$poll' => $poll,
-				'$handle' => xmlify($myaddr),
-				'$public' => $public,
-				'$created' => $created,
-				'$provider' => (($item['app']) ? $item['app'] : t('$projectname'))
-			]
-		);
+
+		// Old style messages using templates - Detect a share element and do a reshare
+
+		if((! $item['item_private']) && ($ret = diaspora_is_reshare($item['body']))) {
+			$msg = replace_macros(get_markup_template('diaspora_reshare.tpl','addon/diaspora'),
+				[
+					'$root_handle' => xmlify($ret['root_handle']),
+					'$root_guid' => $ret['root_guid'],
+					'$guid' => $item['mid'],
+					'$handle' => xmlify($myaddr),
+					'$public' => $public,
+					'$created' => $created,
+					'$provider' => (($item['app']) ? $item['app'] : t('$projectname'))
+				]
+			);
+		} 
+		else {
+			$msg = replace_macros(get_markup_template('diaspora_post.tpl','addon/diaspora'),
+				[
+					'$body' => xmlify($body),
+					'$guid' => $item['mid'],
+					'$poll' => $poll,
+					'$handle' => xmlify($myaddr),
+					'$public' => $public,
+					'$created' => $created,
+					'$provider' => (($item['app']) ? $item['app'] : t('$projectname'))
+				]
+			);
+		}
 	}
 
 	return $msg;
 }
+
+
+
+function get_diaspora_reshare_xml($url,$recurse = 0) {
+
+	$x = z_fetch_url($url);
+	if(! $x['success'])
+		$x = z_fetch_url(str_replace('https://','http://',$url));
+
+	if($x['success']) {
+		// it is (hopefully) a magic envelope
+		$basedom = parse_xml_string($x['body'],false);
+		if($basedom === false) {
+			logger('no xml found');
+			return false;
+		}
+
+		$children = $basedom->children('http://salmon-protocol.org/ns/magic-env');
+		$author_link = str_replace('acct:','',base64url_decode($children->sig[0]->attributes()->key_id[0]));
+		$dom = $basedom->children(NAMESPACE_SALMON_ME);
+
+		if($dom->provenance->data)
+			$base = $dom->provenance;
+		elseif($dom->env->data)
+			$base = $dom->env;
+		elseif($dom->data)
+			$base = $dom;
+
+		if(! $base) {
+			logger('unable to locate salmon data in xml ', LOGGER_NORMAL, LOG_ERR);
+			return false;
+		}
+
+
+		// Stash the signature away for now. We have to find their key or it won't be good for anything.
+		$signature = base64url_decode($base->sig);
+
+		$data = str_replace(array(" ","\t","\r","\n"),array("","","",""),$base->data);
+
+		$type     = $base->data[0]->attributes()->type[0];
+		$encoding = $base->encoding;
+		$alg      = $base->alg;
+
+		$signed_data = $data  . '.' . base64url_encode($type,false) . '.' 
+			. base64url_encode($encoding,false) . '.' . base64url_encode($alg,false);
+
+		// decode the data
+		$data = base64url_decode($data);
+
+	   if(! $author_link) {
+			logger('Could not retrieve author URI.');
+			return false;
+		}
+
+		// Once we have the author URI, go to the web and try to find their public key
+		// (first this will look it up locally if it is in the fcontact cache)
+		// This will also convert diaspora public key from pkcs#1 to pkcs#8
+
+		logger('Fetching key for ' . $author_link );
+		$key = get_diaspora_key($author_link);
+
+		if(! $key) {
+			logger('Could not retrieve author key.', LOGGER_NORMAL, LOG_WARNING);
+			return false;
+		}
+
+		$verify = rsa_verify($signed_data,$signature,$key);
+
+		if(! $verify) {
+			logger('Message did not verify. Discarding.', LOGGER_NORMAL, LOG_ERR);
+			return false;
+		}	
+
+		logger('Message verified.');
+
+		$body = $data;
+
+	}
+	else {
+		// fetch the old-style xml
+		$url = str_replace('/fetch/post/','p',$url) . '.xml';
+
+		$x = z_fetch_url($url);
+		if(! $x['success'])
+			$x = z_fetch_url(str_replace('https://','http://',$url));
+
+		if(! $x['success']) {
+			logger('get_diaspora_reshare_xml: unable to fetch source url ' . $url);
+			return false;
+		}
+		$body = $x['body'];
+	}
+
+
+	logger('get_diaspora_reshare_xml: source: ' . $body, LOGGER_DEBUG);
+
+	$source_xml = xml2array($body,false,0,'tag');
+
+	if(! $source_xml) {
+		logger('get_diaspora_reshare_xml: unparseable result from ' . $url);
+		return '';
+	}
+
+	if($source_xml) {
+		if(array_key_exists('xml',$source_xml) && array_key_exists('post',$source_xml['xml'])) 
+			$source_xml = $source_xml['xml']['post'];
+	}
+
+	if($source_xml['status_message']) {
+		return $source_xml;
+	}
+
+	// see if it's a reshare of a reshare
+	
+	if($source_xml['reshare'])
+		$xml = $source_xml['reshare'];
+	else 
+		return false;
+
+	if(($xml['root_diaspora_id'] || $xml['root_author']) && $xml['root_guid'] && $recurse < 15) {
+		$orig_author = notags(diaspora_get_root_author($xml));
+		$orig_guid = notags(unxmlify($xml['root_guid']));
+		$source_url = 'https://' . substr($orig_author,strpos($orig_author,'@') + 1) . '/fetch/post/' . $orig_guid ;
+		$y = get_diaspora_reshare_xml($source_url,$recurse + 1);
+		if($y)
+			return $y;
+	}
+	return false;
+}
+
